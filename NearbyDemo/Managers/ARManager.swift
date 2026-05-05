@@ -19,7 +19,7 @@ class ARManager: NSObject, ObservableObject {
 
     func start() {
         let config = ARWorldTrackingConfiguration()
-        config.worldAlignment = .gravity
+        config.worldAlignment = .gravityAndHeading
         config.planeDetection = []
         config.isAutoFocusEnabled = false
         session.run(config, options: [.resetTracking, .removeExistingAnchors])

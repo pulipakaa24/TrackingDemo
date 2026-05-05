@@ -8,6 +8,7 @@ struct NearbyDemoApp: App {
     @StateObject private var ni  = NIManager()
     @StateObject private var ar  = ARManager()
     @StateObject private var estimator = AnchorEstimator()
+    @StateObject private var radar = RadarManager()
 
     var body: some Scene {
         WindowGroup {
@@ -16,6 +17,7 @@ struct NearbyDemoApp: App {
                 .environmentObject(ni)
                 .environmentObject(ar)
                 .environmentObject(estimator)
+                .environmentObject(radar)
                 .onAppear {
                     wireManagers()
                     ar.start()
@@ -25,9 +27,14 @@ struct NearbyDemoApp: App {
     }
 
     private func wireManagers() {
-        // BLE → NI: forward raw accessory bytes into the NI state machine
+        // BLE → NI: forward Qorvo DWM bytes into the NI state machine
         ble.onAccessoryData = { [weak ni] data in
             ni?.handleAccessoryData(data)
+        }
+
+        // BLE → Radar: forward ESP32 bytes into the radar manager
+        ble.onESPData = { [weak radar] data in
+            radar?.handleAccessoryData(data)
         }
 
         // NI → BLE: send outbound messages to the accessory
@@ -53,8 +60,13 @@ struct NearbyDemoApp: App {
 
         // NI range-only updates → fuse with AR pose → feed Gauss-Newton estimator.
         // This runs when camera assistance hasn't converged yet or isn't supported.
+        // Gate on .normal tracking: with .gravityAndHeading alignment, poses are unreliable
+        // during .limited(.initializing) because the compass frame is still calibrating.
+        // Feeding the Gauss-Newton solver inconsistent poses from a drifting frame prevents
+        // convergence — we wait for a stable coordinate system before adding measurements.
         ni.onRangeUpdate = { [weak ar, weak estimator] range, timestamp in
             guard let ar, let estimator else { return }
+            guard case .normal = ar.trackingState else { return }
             guard let pose = ar.poseAt(timestamp: timestamp) else { return }
             let position = simd_float3(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
             // Camera forward in world space: -Z column of the camera transform

@@ -6,52 +6,64 @@ import Combine
 struct ARViewContainer: UIViewRepresentable {
     @ObservedObject var arManager: ARManager
     @ObservedObject var estimator: AnchorEstimator
+    @ObservedObject var radar: RadarManager
 
     func makeUIView(context: Context) -> ARView {
         let arView = ARView(frame: .zero, cameraMode: .ar, automaticallyConfigureSession: false)
         arView.session = arManager.session
 
-        // Create the red sphere entity representing the UWB anchor
-        let sphereRadius: Float = 0.05
-        let mesh = MeshResource.generateSphere(radius: sphereRadius)
-        var material = UnlitMaterial()
-        material.color = .init(tint: .red)
-        let sphereEntity = ModelEntity(mesh: mesh, materials: [material])
-        sphereEntity.isEnabled = false
+        // AnchorEntity is pinned at world origin by ARKit and cannot be moved dynamically.
+        // All content that needs to track the DWM position lives inside `trackingParent`,
+        // a plain Entity whose position we update freely every frame via setPosition(relativeTo:nil).
+        let sceneAnchor = AnchorEntity(world: .zero)
+        arView.scene.addAnchor(sceneAnchor)
 
-        let anchorEntity = AnchorEntity(world: .zero)
-        anchorEntity.addChild(sphereEntity)
-        arView.scene.addAnchor(anchorEntity)
+        let trackingParent = Entity()
+        sceneAnchor.addChild(trackingParent)
+
+        // Green sphere marks the UWB (DWM) anchor position
+        let mesh = MeshResource.generateSphere(radius: 0.05)
+        var material = UnlitMaterial()
+        material.color = .init(tint: .green)
+        let anchorVisualEntity = ModelEntity(mesh: mesh, materials: [material])
+        anchorVisualEntity.isEnabled = false   // hidden until the DWM position is known
+        trackingParent.addChild(anchorVisualEntity)
 
         let coordinator = context.coordinator
-        coordinator.sphereEntity = sphereEntity
+        coordinator.anchorVisualEntity = anchorVisualEntity
+        coordinator.trackingParent = trackingParent
 
-        // SceneEvents.Update fires every rendered frame on the main thread.
-        // Updating sphere position here (rather than from the Combine sink) means:
-        //   1. The sphere is never "frozen" between 4 Hz UWB pings — it always reflects
-        //      the latest world-space estimate relative to the smoothly moving camera.
-        //   2. We can apply EMA smoothing to hide step-changes from the solver.
-        coordinator.updateSub = arView.scene.subscribe(to: SceneEvents.Update.self) { [weak estimator, weak coordinator, weak sphereEntity, weak arView] _ in
-            guard let estimator, let coordinator, let sphereEntity else { return }
+        // SceneEvents.Update fires every rendered frame on the render thread.
+        coordinator.updateSub = arView.scene.subscribe(to: SceneEvents.Update.self) {
+            [weak estimator, weak radar, weak coordinator, weak anchorVisualEntity, weak arView] _ in
+            guard let estimator, let radar, let coordinator,
+                  let anchorVisualEntity, let trackingParent = coordinator.trackingParent else { return }
 
-            // EMA-smooth toward the latest estimate every frame.
-            // α ≈ 0.12 at 60 fps → time constant ≈ 120 ms. Hides solver step-changes
-            // without making the sphere feel sluggish.
             let alpha: Float = 0.12
+
             if let target = estimator.anchorPosition {
+                // EMA-smooth toward the latest DWM estimate every frame to hide solver step-changes.
                 if let current = coordinator.smoothedPosition {
                     coordinator.smoothedPosition = current + alpha * (target - current)
                 } else {
-                    coordinator.smoothedPosition = target  // snap on first appearance
+                    coordinator.smoothedPosition = target
                 }
-                sphereEntity.setPosition(coordinator.smoothedPosition!, relativeTo: nil)
-                sphereEntity.isEnabled = true
+                // Move the plain Entity (not the AnchorEntity) — this is what actually works.
+                trackingParent.setPosition(coordinator.smoothedPosition!, relativeTo: nil)
+                anchorVisualEntity.isEnabled = true
             } else {
+                // No DWM estimate yet — hide everything and clear the smoothed position so
+                // the first real estimate snaps in without an EMA lag from a stale position.
                 coordinator.smoothedPosition = nil
-                sphereEntity.isEnabled = false
+                anchorVisualEntity.isEnabled = false
             }
 
-            // Off-screen directional indicator using the smoothed position
+            // Blobs are children of trackingParent so their positions are automatically
+            // relative to the DWM anchor. Only show them when the anchor position is known.
+            let blobsToShow = estimator.anchorPosition != nil ? radar.blobs : []
+            coordinator.syncBlobs(blobs: blobsToShow, parent: trackingParent)
+
+            // Off-screen directional indicator
             guard let arView else { return }
             guard let position = coordinator.smoothedPosition else {
                 if coordinator.lastAngle != nil {
@@ -73,7 +85,8 @@ struct ARViewContainer: UIViewRepresentable {
                 let cameraTransform = camera.transform
                 let localPos4 = simd_mul(simd_inverse(cameraTransform),
                                         simd_float4(position.x, position.y, position.z, 1.0))
-                let angle = Double(atan2(localPos4.y, localPos4.x))
+                // Camera sensor is landscape-right; in portrait: sensor +X = UI up, sensor +Y = UI right.
+                let angle = Double(atan2(localPos4.x, localPos4.y))
                 if coordinator.lastAngle == nil || abs(coordinator.lastAngle! - angle) > 0.05 {
                     coordinator.lastAngle = angle
                     DispatchQueue.main.async { estimator.offScreenAngle = angle }
@@ -91,14 +104,80 @@ struct ARViewContainer: UIViewRepresentable {
 
     func updateUIView(_ uiView: ARView, context: Context) {}
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     class Coordinator {
-        var sphereEntity: ModelEntity?
+        var anchorVisualEntity: ModelEntity?
+        var trackingParent: Entity?
         var updateSub: (any Cancellable)?
         var smoothedPosition: simd_float3? = nil
         var lastAngle: Double?
+
+        var blobEntities: [Entity] = []
+
+        func syncBlobs(blobs: [RadarBlob], parent: Entity) {
+            for (index, blob) in blobs.enumerated() {
+                let entity: Entity
+                if index < blobEntities.count {
+                    entity = blobEntities[index]
+                    entity.isEnabled = true
+                } else {
+                    let mesh = MeshResource.generateSphere(radius: 0.1)
+                    let material = UnlitMaterial()
+                    let model = ModelEntity(mesh: mesh, materials: [material])
+
+                    let text = MeshResource.generateText(
+                        "", extrusionDepth: 0.01,
+                        font: .systemFont(ofSize: 0.1),
+                        containerFrame: .zero,
+                        alignment: .center,
+                        lineBreakMode: .byWordWrapping)
+                    let textModel = ModelEntity(mesh: text, materials: [UnlitMaterial(color: .white)])
+                    textModel.position = [0, 0.15, 0]
+                    textModel.name = "textNode"
+
+                    let parentNode = Entity()
+                    parent.addChild(parentNode)
+                    parentNode.addChild(model)
+                    parentNode.addChild(textModel)
+
+                    blobEntities.append(parentNode)
+                    entity = parentNode
+                }
+
+                entity.position = blob.position
+
+                if let model = entity.children.first as? ModelEntity,
+                   let textNode = entity.findEntity(named: "textNode") as? ModelEntity {
+                    var mat = UnlitMaterial()
+                    if blob.classId == 1 {
+                        mat.color = .init(tint: .green)
+                    } else if blob.classId == 2 {
+                        mat.color = .init(tint: .red)
+                    } else {
+                        mat.color = .init(tint: .gray)
+                    }
+                    model.model?.materials = [mat]
+
+                    let label: String
+                    if blob.classId == 1 { label = "ACTIVE" }
+                    else if blob.classId == 2 { label = "UNCONSCIOUS" }
+                    else { label = "NOISE" }
+
+                    textNode.model?.mesh = MeshResource.generateText(
+                        label, extrusionDepth: 0.01,
+                        font: .systemFont(ofSize: 0.1),
+                        containerFrame: .zero,
+                        alignment: .center,
+                        lineBreakMode: .byWordWrapping)
+
+                    textNode.components.set(BillboardComponent())
+                }
+            }
+
+            for index in blobs.count..<blobEntities.count {
+                blobEntities[index].isEnabled = false
+            }
+        }
     }
 }

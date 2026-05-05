@@ -6,10 +6,11 @@ struct ContentView: View {
     @EnvironmentObject var ni: NIManager
     @EnvironmentObject var ar: ARManager
     @EnvironmentObject var estimator: AnchorEstimator
+    @EnvironmentObject var radar: RadarManager
 
     var body: some View {
         ZStack {
-            ARViewContainer(arManager: ar, estimator: estimator)
+            ARViewContainer(arManager: ar, estimator: estimator, radar: radar)
                 .ignoresSafeArea()
 
             if let angle = estimator.offScreenAngle {
@@ -30,7 +31,7 @@ struct ContentView: View {
             }
 
             VStack {
-                HUDView(ble: ble, ni: ni, estimator: estimator)
+                HUDView(ble: ble, ni: ni, ar: ar, estimator: estimator)
                     .padding()
                 Spacer()
                 Button("Reset Estimate") {
@@ -49,12 +50,14 @@ struct ContentView: View {
 private struct HUDView: View {
     @ObservedObject var ble: BLEManager
     @ObservedObject var ni: NIManager
+    @ObservedObject var ar: ARManager
     @ObservedObject var estimator: AnchorEstimator
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HUDRow(label: "BLE", value: bleStateText)
             HUDRow(label: "NI", value: niStateText)
+            HUDRow(label: "AR", value: arTrackingText)
             HUDRow(label: "Range", value: rangeText)
             HUDRow(label: "Measurements", value: "\(estimator.measurementCount)")
             HUDRow(label: "Residual", value: String(format: "%.3f m", estimator.residualError))
@@ -80,6 +83,21 @@ private struct HUDView: View {
         case .configuring:          return "Configuring…"
         case .ranging:              return "Ranging"
         case .error(let msg):       return "Error: \(msg)"
+        }
+    }
+
+    private var arTrackingText: String {
+        switch ar.trackingState {
+        case .notAvailable:          return "Not Available"
+        case .normal:                return "Normal"
+        case .limited(let reason):
+            switch reason {
+            case .initializing:      return "Initializing…"
+            case .excessiveMotion:   return "Excessive Motion"
+            case .insufficientFeatures: return "Insuff. Features"
+            case .relocalizing:      return "Relocalizing…"
+            @unknown default:        return "Limited"
+            }
         }
     }
 
@@ -114,4 +132,5 @@ private struct HUDRow: View {
         .environmentObject(NIManager())
         .environmentObject(ARManager())
         .environmentObject(AnchorEstimator())
+        .environmentObject(RadarManager())
 }
